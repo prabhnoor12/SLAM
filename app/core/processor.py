@@ -1,3 +1,30 @@
+import shutil
+from pathlib import Path
+
+def archive_on_index(file_path: str, archive_dir: str = "./archive") -> str:
+    """
+    Moves a file to the archive directory after successful indexing.
+    Returns the new path.
+    """
+    source = Path(file_path)
+    dest_dir = Path(archive_dir)
+    dest_dir.mkdir(exist_ok=True)
+    destination = dest_dir / source.name
+    try:
+        # If a file with the same name exists, append a suffix to avoid overwriting
+        counter = 1
+        while destination.exists():
+            destination = dest_dir / f"{source.stem}_{counter}{source.suffix}"
+            counter += 1
+        shutil.move(str(source), str(destination))
+        return str(destination)
+    except Exception as e:
+        try:
+            from app.core.logic import logger
+            logger.error(f"Archive failed for {file_path}: {e}")
+        except Exception:
+            print(f"Archive failed for {file_path}: {e}")
+        return file_path
 
 import fitz
 import pytesseract

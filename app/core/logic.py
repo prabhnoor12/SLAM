@@ -85,19 +85,39 @@ class SLAMBackend:
                 text = self.logic_processor.process(text)
 
             # 3. Vectorization & Batching
+            chunk_ids = []
+            chunk_vectors = []
+            chunk_metas = []
             for i, chunk in enumerate(self.chunk_text(text)):
                 vector = self.engine.encode(chunk)
-                
-                self._batch_cache["ids"].append(f"{path}_{i}")
-                self._batch_cache["vectors"].append(vector.tolist())
-                self._batch_cache["metas"].append({
+                chunk_id = f"{path}_{i}"
+                meta = {
                     "path": str(path),
                     "hash": current_hash,
                     "chunk_id": i
-                })
+                }
+                chunk_ids.append(chunk_id)
+                chunk_vectors.append(vector.tolist())
+                chunk_metas.append(meta)
 
-                if len(self._batch_cache["ids"]) >= self.batch_size:
-                    self.flush_batch()
+            # 4. Commit to DB (atomic before moving file)
+            if chunk_ids:
+                self.db.collection.upsert(
+                    ids=chunk_ids,
+                    embeddings=chunk_vectors,
+                    metadatas=chunk_metas
+                )
+
+            # 5. POST-PROCESSING: Archive the file
+            from app.core.processor import archive_on_index
+            new_path = archive_on_index(path)
+            # If the path changed, update metadata in DB (optional: update in place or re-upsert)
+            if new_path != path:
+                for meta in chunk_metas:
+                    if meta["path"] == path:
+                        meta["path"] = new_path
+                # Optionally, update DB with new path metadata
+            logger.info(f"File archived to: {new_path}")
 
         except Exception as e:
             logger.error(f"Failed to process {path}: {str(e)}")
