@@ -1,12 +1,10 @@
 import os
 import hashlib
-import logging
+from app.utils.diagnostics import logger, profile_performance
 from abc import ABC, abstractmethod
 from typing import Any, Callable, List, Dict, Generator, Optional
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("SLAM_Backend")
+
 
 # --- 🧠 Logic Processor Architecture ---
 
@@ -63,6 +61,7 @@ class SLAMBackend:
         for i in range(0, len(text), size):
             yield text[i : i + size]
 
+    @profile_performance
     def handle_new_file(self, path: str):
         if not os.access(path, os.R_OK):
             logger.error(f"Access Denied: {path}")
@@ -123,6 +122,7 @@ class SLAMBackend:
             logger.error(f"Failed to process {path}: {str(e)}")
             self.dead_letter_queue.append(path)
 
+    @profile_performance
     def flush_batch(self):
         """Commits cached vectors to the database."""
         if not self._batch_cache["ids"]:

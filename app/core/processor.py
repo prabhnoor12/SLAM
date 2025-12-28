@@ -1,98 +1,159 @@
 import os
-import shutil
-import pathlib
-import logging
-import concurrent.futures
-from pathlib import Path
-from PIL import Image
-import fitz  # PyMuPDF
+import fitz
 import pytesseract
+import pathlib
+from app.utils.diagnostics import logger, profile_performance
+import concurrent.futures
+import hashlib
+import zipfile
+import tarfile
+from PIL import Image, ImageOps
+from typing import Generator, Dict, List, Any, Optional
 
-logger = logging.getLogger("SLAM_Processor")
+# Optional dependency for encoding detection
+try:
+    import chardet
+except ImportError:
+    chardet = None
 
-class FileProcessor:
-    def extract_text(self, path: str, max_length: int = 10000) -> str:
-        """Central router for text extraction based on file signature."""
-        path_obj = pathlib.Path(path)
-        if not path_obj.exists():
-            return ""
-            
-        ext = path_obj.suffix.lower()
-        try:
-            if ext == '.pdf':
-                return self._extract_pdf_text(path, max_length)
-            elif ext in {'.png', '.jpg', '.jpeg', '.tiff', '.bmp'}:
-                return self._extract_image_text(path, max_length)
-            # Default to plain text for everything else (txt, md, log, csv)
-            return self._extract_plain_text(path, max_length)
-        except Exception as e:
-            logger.error(f"Failed to process {path}: {e}")
-            return ""
 
-    def _extract_pdf_text(self, path: str, max_length: int) -> str:
-        text_parts = []
+
+# --- 🔌 Modern Extractor Architecture ---
+
+class BaseExtractor:
+    """Interface for all file extractors."""
+    @staticmethod
+    def extract_all(processor, path: str, options: dict) -> dict:
+        raise NotImplementedError
+
+    @staticmethod
+    def yield_chunks(processor, path: str, max_length: int) -> Generator:
+        raise NotImplementedError
+
+class ProcessorRegistry:
+    def __init__(self):
+        self._registry: Dict[str, BaseExtractor] = {}
+
+    def register(self, extensions: List[str]):
+        def decorator(cls):
+            for ext in extensions:
+                self._registry[ext.lower()] = cls
+            return cls
+        return decorator
+
+    def get(self, ext: str) -> Optional[BaseExtractor]:
+        return self._registry.get(ext.lower())
+
+registry = ProcessorRegistry()
+
+# --- 📂 Implementation: PDF ---
+
+@registry.register(['.pdf'])
+class PDFExtractor(BaseExtractor):
+    @staticmethod
+    def extract_all(processor, path, options):
+        result = {"text": [], "images": [], "metadata": {}}
+        with fitz.open(path) as doc:
+            result["metadata"] = doc.metadata
+            for page in doc:
+                blocks = page.get_text("blocks")
+                for b in blocks:
+                    if len(b[4].strip()) > 20:
+                        result["text"].append({"text": b[4].strip(), "page": page.number + 1, "bbox": b[:4]})
+        return result
+
+    @staticmethod
+    def yield_chunks(processor, path, max_length):
         with fitz.open(path) as doc:
             for page in doc:
-                text_parts.append(page.get_text())
-                if sum(len(p) for p in text_parts) > max_length:
-                    break
-        return "".join(text_parts)[:max_length]
+                for b in page.get_text("blocks"):
+                    if len(b[4].strip()) > 20:
+                        yield {"text": b[4].strip(), "page": page.number + 1, "bbox": b[:4], "type": "pdf_block"}
 
-    def _extract_image_text(self, path: str, max_length: int) -> str:
-        # Crucial: Use with-statement to ensure file handle is released
+# --- 🖼️ Implementation: Images ---
+
+@registry.register(['.png', '.jpg', '.jpeg', '.tiff', '.bmp'])
+class ImageExtractor(BaseExtractor):
+    @staticmethod
+    def extract_all(processor, path, options):
+        return {"text": processor._extract_image_text(path), "images": [path], "metadata": {}}
+
+    @staticmethod
+    def yield_chunks(processor, path, max_length):
+        text = processor._extract_image_text(path)
+        if text.strip():
+            yield {"text": text, "page": 1, "type": "ocr_result"}
+
+# --- 📦 Implementation: Archives (ZIP) ---
+
+@registry.register(['.zip'])
+class ZipExtractor(BaseExtractor):
+    MAX_SIZE = 100 * 1024 * 1024  # 100MB Safety Limit
+
+    @staticmethod
+    def extract_all(processor, path, options):
+        result = {"text": [], "metadata": {"type": "archive"}}
+        with zipfile.ZipFile(path, 'r') as z:
+            for name in z.namelist():
+                if z.getinfo(name).file_size > ZipExtractor.MAX_SIZE: continue
+                if any(name.endswith(ext) for ext in ['.txt', '.md', '.py', '.log']):
+                    with z.open(name) as f:
+                        text = f.read().decode('utf-8', errors='replace')
+                        result["text"].append({"text": text, "filename": name})
+        return result
+
+# --- 🚀 The Main Processor Engine ---
+
+class FileProcessor:
+    def __init__(self, ocr_lang='eng', max_workers=4):
+        self.ocr_lang = ocr_lang
+        self.tess_config = r'--oem 3 --psm 3'
+        self.max_workers = max_workers
+
+    @profile_performance
+    def get_smart_chunks(self, path: str) -> Generator:
+        ext = pathlib.Path(path).suffix.lower()
+        extractor = registry.get(ext)
+        if extractor:
+            yield from extractor.yield_chunks(self, path, 1500)
+        else:
+            # Default text fallback
+            text = self._extract_plain_text(path)
+            if text: yield {"text": text, "page": 1, "type": "raw_text"}
+
+    def _extract_image_text(self, path):
         with Image.open(path) as img:
-            text = pytesseract.image_to_string(img)
-        return text[:max_length]
+            processed_img = ImageOps.grayscale(img)
+            return pytesseract.image_to_string(processed_img, lang=self.ocr_lang, config=self.tess_config)
 
-    def _extract_plain_text(self, path: str, max_length: int) -> str:
-        # Use errors='replace' to prevent crashes on binary characters
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            return f.read(max_length)
+    @profile_performance
+    def _extract_plain_text(self, path, max_length=10000):
+        # Auto-encoding detection logic
+        enc = 'utf-8'
+        if chardet:
+            with open(path, 'rb') as f:
+                enc = chardet.detect(f.read(4096))['encoding'] or 'utf-8'
+        
+        try:
+            with open(path, 'r', encoding=enc, errors='replace') as f:
+                return f.read(max_length)
+        except:
+            return ""
 
-    def batch_extract_text(self, paths, max_length=10000, max_workers=4):
-        """
-        Uses ProcessPoolExecutor for CPU-bound OCR tasks.
-        Threads are better for I/O, but Processes are better for OCR.
-        """
+    @profile_performance
+    def batch_extract(self, paths: List[str]):
+        """Hybrid Batch: Uses ProcessPool for CPU heavy tasks."""
         results = {}
-        # We use ProcessPoolExecutor here because Tesseract is CPU-intensive
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            future_to_path = {
-                executor.submit(self.extract_text, path, max_length): path 
-                for path in paths
-            }
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_path = {executor.submit(self._extract_all_wrapper, p): p for p in paths}
             for future in concurrent.futures.as_completed(future_to_path):
-                path = future_to_path[future]
-                try:
-                    results[path] = future.result()
-                except Exception:
-                    results[path] = ""
+                results[future_to_path[future]] = future.result()
         return results
 
-# --- 📂 Archive Function ---
-
-def archive_on_index(file_path: str, archive_dir: str = "./archive") -> str:
-    """
-    Safely moves a file to an archive. Handles name collisions.
-    """
-    source = Path(file_path)
-    if not source.exists():
-        return file_path
-
-    dest_dir = Path(archive_dir)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Generate unique destination path
-    destination = dest_dir / source.name
-    counter = 1
-    while destination.exists():
-        destination = dest_dir / f"{source.stem}_{counter}{source.suffix}"
-        counter += 1
-    
-    try:
-        # shutil.move is safer than os.rename across different drives/partitions
-        shutil.move(str(source), str(destination))
-        return str(destination)
-    except Exception as e:
-        logger.error(f"Archive failed for {file_path}: {e}")
-        return file_path
+    @staticmethod
+    def _extract_all_wrapper(path):
+        # Helper for pickling in ProcessPool
+        p = FileProcessor()
+        ext = pathlib.Path(path).suffix.lower()
+        extractor = registry.get(ext)
+        return extractor.extract_all(p, path, {}) if extractor else None
