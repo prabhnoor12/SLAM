@@ -1,0 +1,8 @@
+PyQt6
+chromadb
+watchdog
+PyMuPDF
+pytesseract
+Pillow
+sentence-transformers
+numpy
