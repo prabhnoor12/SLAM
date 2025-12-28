@@ -5,24 +5,43 @@ import pathlib
 from PIL import Image
 import os
 
+
+import concurrent.futures
+
 class FileProcessor:
     def extract_text(self, path, max_length=10000):
         """
         Extract text from PDF, image, or text file. Optionally limit text length.
+        Extensible for new file types.
         """
         ext = pathlib.Path(path).suffix.lower()
         try:
             if ext == '.pdf':
-                with fitz.open(path) as doc:
-                    text = "".join([page.get_text() for page in doc])
-                return text[:max_length]
+                return self._extract_pdf_text(path, max_length)
             elif ext in ['.png', '.jpg', '.jpeg']:
-                with Image.open(path) as img:
-                    return pytesseract.image_to_string(img)[:max_length]
-            with open(path, 'r', errors='ignore') as f:
-                return f.read(max_length)
+                return self._extract_image_text(path, max_length)
+            elif ext in ['.txt', '.md', '.csv', '.log']:
+                return self._extract_plain_text(path, max_length)
+            # Add more file type handlers here as needed
+            else:
+                return self._extract_plain_text(path, max_length)
         except Exception as e:
+            # Log error or handle as needed
             return ""
+
+    def _extract_pdf_text(self, path, max_length):
+        with fitz.open(path) as doc:
+            text = "".join([page.get_text() for page in doc])
+        return text[:max_length]
+
+    def _extract_image_text(self, path, max_length):
+        with Image.open(path) as img:
+            return pytesseract.image_to_string(img)[:max_length]
+
+    def _extract_plain_text(self, path, max_length):
+        with open(path, 'r', errors='ignore') as f:
+            return f.read(max_length)
+
 
     def extract_images_from_pdf(self, path, output_dir=None):
         """
@@ -48,11 +67,25 @@ class FileProcessor:
                     images.append(img_path)
         return images
 
-    def batch_extract_text(self, paths, max_length=10000):
+    def batch_extract_text(self, paths, max_length=10000, parallel=True, max_workers=4):
         """
         Process multiple files and return a dict of {path: text}.
+        Supports parallel processing for speed.
         """
         results = {}
-        for path in paths:
-            results[path] = self.extract_text(path, max_length=max_length)
+        if parallel:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_path = {executor.submit(self.extract_text, path, max_length): path for path in paths}
+                for future in concurrent.futures.as_completed(future_to_path):
+                    path = future_to_path[future]
+                    try:
+                        results[path] = future.result()
+                    except Exception:
+                        results[path] = ""
+        else:
+            for path in paths:
+                try:
+                    results[path] = self.extract_text(path, max_length=max_length)
+                except Exception:
+                    results[path] = ""
         return results
